@@ -139,23 +139,22 @@ class UniversalNavigation {
   async initialize() {
     console.log("Initializing BlindMate Navigation System...");
 
-    this.setupSpeechRecognition();
+    // The dashboard already has the single camera/model/voice controller in
+    // app.js. Do not initialize a second camera, COCO-SSD model, microphone
+    // recognizer, or permission flow here. That duplicate initialization was
+    // the main source of startup lag and competing voices.
     this.setupUIEventListeners();
     document.addEventListener("visibilitychange", () => this.handleVisibilityChange());
-
-    // Request all permissions on page load
-    await this.requestAllPermissions();
-
-    // Initialize camera for obstacle detection
-    await this.initializeCamera();
-
-    // Load object detection model
-    await this.loadModel();
-
-    // Leaflet needs no API key or async fetch - initialize the map
-    // directly (index.html also calls this once the DOM/Leaflet script
-    // is ready, this call is idempotent so either order is safe).
     this.initializeMap();
+
+    // The standalone navigation page may use this class directly. Only that
+    // page gets the navigation-specific recognizer/permissions/model.
+    if (window.location.pathname === "/navigation") {
+      this.setupSpeechRecognition();
+      await this.requestAllPermissions();
+      await this.initializeCamera();
+      await this.loadModel();
+    }
 
     console.log("BlindMate Navigation System initialized");
 
@@ -763,8 +762,6 @@ class UniversalNavigation {
       // Start intelligent GPS tracking with battery optimization
       this.startContinuousGPSTracking();
 
-      // Start real-time obstacle alert system
-      this.startObstacleAlertSystem();
 
       // Display route on map if available
       if (this.map) {
@@ -774,8 +771,6 @@ class UniversalNavigation {
       // Start navigation announcements
       this.announceRoute();
 
-      // Enable obstacle detection during navigation
-      this.startObstacleDetection();
 
       // Update UI state
       this.updateMainButtonState();
@@ -1625,54 +1620,19 @@ class UniversalNavigation {
    * Enhanced speech synthesis with smooth overlapping voice cancellation
    */
   speak(text, priority = "normal") {
-    this.speakWithPriority(text, priority);
+    return this.speakWithPriority(text, priority);
   }
 
   /**
    * Speak with priority and overlapping voice management
    */
   async speakWithPriority(text, priority = "normal") {
-    console.log(`Speaking (${priority}): ${text}`);
-
-    try {
-      // Navigation messages are generated in English by the routing engine.
-      // Translate them before speaking so every turn/arrival/safety message
-      // follows the language selected by the user.
-      const currentLanguage = localStorage.getItem("blindmate_language") || "en-IN";
-      let spokenText = text;
-      if (currentLanguage !== "en-IN") {
-        try {
-          const response = await fetch("/api/translate", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text, language: currentLanguage }),
-          });
-          const result = await response.json();
-          if (result.success && result.translated) spokenText = result.translated;
-        } catch (translationError) {
-          console.warn("Navigation speech translation failed:", translationError);
-        }
-      }
-
-      // Always use the project's server TTS. This avoids depending on
-      // Windows/browser-installed voices and gives the same language output
-      // on Windows, Android and iOS.
-      if (this.speechCancellationTimer) {
-        clearTimeout(this.speechCancellationTimer);
-        this.speechCancellationTimer = null;
-      }
-      if (this.speechSynthesis && (this.speechSynthesis.speaking || this.speechSynthesis.pending)) {
-        this.speechSynthesis.cancel();
-      }
-      if (this.serverAudio) {
-        try { this.serverAudio.pause(); } catch (_) {}
-        this.serverAudio = null;
-      }
-      this.playServerTTS(spokenText, currentLanguage, priority);
-    } catch (error) {
-      console.error("Speech synthesis error:", error);
-      this.handleSpeechError(text);
+    // AIVI has one speech owner: app.js. Keeping navigation on its own
+    // speech/translation/TTS pipeline caused duplicate voices and latency.
+    if (window.blindMate && typeof window.blindMate.speak === "function") {
+      return window.blindMate.speak(text, priority === "high");
     }
+    return false;
   }
 
   /**
@@ -1830,10 +1790,6 @@ class UniversalNavigation {
   }
   async playServerTTS(text, language, priority = "normal") {
     try {
-      if (this.serverAudio) {
-        try { this.serverAudio.pause(); } catch (_) {}
-        this.serverAudio = null;
-      }
       const response = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1843,19 +1799,16 @@ class UniversalNavigation {
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
-      this.serverAudio = audio;
       audio.volume = 1;
       this.isSpeaking = true;
       if (window.blindMate) window.blindMate.isSpeaking = true;
       audio.onended = () => {
         URL.revokeObjectURL(url);
-        if (this.serverAudio === audio) this.serverAudio = null;
         this.isSpeaking = false;
         if (window.blindMate) window.blindMate.isSpeaking = false;
       };
       audio.onerror = () => {
         URL.revokeObjectURL(url);
-        if (this.serverAudio === audio) this.serverAudio = null;
         this.isSpeaking = false;
         if (window.blindMate) window.blindMate.isSpeaking = false;
         this.showTextInUI(text);

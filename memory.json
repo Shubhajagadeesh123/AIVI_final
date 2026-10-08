@@ -1,0 +1,12 @@
+[
+    {
+        "object": "person",
+        "location": "ahead of you, 1 meter away",
+        "position": "ahead of you",
+        "distance": "1 meter away",
+        "scene": "I can see person ahead of you, very close, person ahead of you, 1 meter away. Please move carefully.",
+        "time": "10/8/2026, 10:12:55 PM",
+        "timestamp": 1791477775873,
+        "language": "en-IN"
+    }
+]

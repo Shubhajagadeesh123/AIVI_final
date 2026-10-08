@@ -35,7 +35,6 @@ class EmergencySOS {
   }
 
   initialize() {
-    window.emergencySOS = this;
     const btn1 = document.getElementById("emergencyBtn");
     const btn2 = document.getElementById("floatingSOS");
 
@@ -297,32 +296,10 @@ class EmergencySOS {
   }
 
   async speak(text) {
-    const language = localStorage.getItem("blindmate_language") || "en-IN";
-    try {
-      let spokenText = text;
-      if (language !== "en-IN") {
-        const translation = await fetch("/api/translate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, language }),
-        });
-        const result = await translation.json();
-        if (result.success && result.translated) spokenText = result.translated;
-      }
-      const response = await fetch("/api/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: spokenText, language }),
-      });
-      if (!response.ok) throw new Error(`TTS HTTP ${response.status}`);
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-      audio.onended = () => URL.revokeObjectURL(url);
-      await audio.play();
-    } catch (error) {
-      console.error("SOS TTS failed:", error);
+    if (window.blindMate && typeof window.blindMate.speak === "function") {
+      return window.blindMate.speak(text, true);
     }
+    return false;
   }
 }
 

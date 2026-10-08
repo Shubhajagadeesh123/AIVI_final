@@ -31,7 +31,6 @@ class Netra {
       this.interactionHistory = [];
     }
     this.lastCommandText = null;
-    this.lastSpokenText = null;
 
     this.memoryCooldown = 60000;
 
@@ -154,6 +153,9 @@ class Netra {
     this.speechCooldown = 2000; // 2 seconds cooldown between speech
     this.isSpeaking = false;
     this.speechQueue = [];
+    this.currentAudio = null;
+    this.voiceTranslationCache = new Map();
+    this.voiceAbortController = null;
 
     // Enhanced speech delay configuration for object announcements
     this.speechDelayTimer = null; // Timer for delaying speech
@@ -200,6 +202,16 @@ class Netra {
       userAgent: navigator.userAgent,
       ontouchstart: "ontouchstart" in window,
       maxTouchPoints: navigator.maxTouchPoints,
+    });
+
+    window.addEventListener("aivi-language-changed", (event) => {
+      const lang = event.detail?.language;
+      if (lang) {
+        this.currentLanguage = lang;
+        if (this.elements.languageSelect) this.elements.languageSelect.value = lang;
+        if (this.commandRecognition) this.commandRecognition.lang = lang;
+        if (this.continuousRecognition) this.continuousRecognition.lang = lang;
+      }
     });
 
     this.init();
@@ -454,21 +466,23 @@ class Netra {
     try {
       this.updateStatus("Initializing Netra...", "info");
 
-      // Load user preferences and check if this is a first-time user
-      await this.loadServerPreferences();
+      // Do not block the UI on a network preference request or AI model load.
+      // The previous version waited here, which made the dashboard feel frozen.
+      this.loadServerPreferences().catch((error) =>
+        console.warn("Background preference load failed:", error),
+      );
       this.checkFirstTimeUser();
 
-      // Initialize DOM elements first
+      // Initialize the interactive UI immediately.
       this.initDOMElements();
-
-      // Setup event listeners
       this.setupEventListeners();
-
-      // Initialize speech recognition
       this.initSpeechRecognition();
 
-      // Load TensorFlow model (optional - app works without it)
-      await this.loadModel();
+      // Load the AI model in the background. Buttons remain responsive while
+      // TensorFlow/COCO-SSD initializes.
+      this.loadModel().catch((error) =>
+        console.warn("Background model load failed:", error),
+      );
 
       // This used to call getElementById(...).addEventListener(...)
       // directly with no null-check, unlike every other button binding
@@ -490,20 +504,12 @@ class Netra {
         console.log("Initialization complete - loading overlay hidden");
       }
 
-      // Start object detection and voice interaction immediately, every
-      // time the app opens - no button press, no confirmation prompt,
-      // no delay.
-      this.startVoiceInteraction();
-      if (this.model && !this.isDetecting) {
-        await this.startDetection();
-      }
+      // Start voice interaction after the UI is ready. Do not await camera,
+      // GPS, or model initialization here.
+      setTimeout(() => this.startVoiceInteraction(), 150);
 
-      // Proactively request location on load too, same pattern as auto-
-      // starting detection above, so it's already available by the time
-      // the user asks for navigation instead of stalling mid-command.
-      // Not awaited - runs in the background without blocking detection
-      // or voice startup.
-      this.requestLocation(true);
+      // Warm up GPS in the background; never block a button click on it.
+      this.requestLocation(true).catch(() => {});
     } catch (error) {
       console.error("Initialization error:", error);
       this.updateStatus(
@@ -2062,22 +2068,6 @@ class Netra {
       return;
     }
 
-    // Accessibility/safety utility commands are handled locally so they
-    // remain available even if the AI service is temporarily unavailable.
-    if (this.isSystemStatusCommand(routingCommand)) {
-      await this.runSystemStatusCheck();
-      return;
-    }
-
-    if (this.isRepeatCommand(routingCommand)) {
-      if (this.lastSpokenText) {
-        this.speak(`Repeating: ${this.lastSpokenText}`, true);
-      } else {
-        this.speak("There is no previous instruction to repeat.", true);
-      }
-      return;
-    }
-
     if (
       lower.includes("what are the shortcuts") ||
       lower.includes("show shortcuts") ||
@@ -2173,64 +2163,6 @@ class Netra {
    * "help me find my phone") and would otherwise hijack them into false
    * emergency alerts. Only clear, unambiguous emergency phrasing matches.
    */
-  isSystemStatusCommand(command) {
-    const lower = String(command || "").toLowerCase().trim();
-    return [
-      "system status",
-      "check system",
-      "check status",
-      "am i ready",
-      "is everything ready",
-      "check my app",
-      "check my aivi",
-    ].some((phrase) => lower === phrase || lower.includes(phrase));
-  }
-
-  isRepeatCommand(command) {
-    const lower = String(command || "").toLowerCase().trim();
-    return [
-      "repeat",
-      "repeat that",
-      "say that again",
-      "say it again",
-      "repeat the instruction",
-      "repeat last instruction",
-    ].some((phrase) => lower === phrase || lower.includes(phrase));
-  }
-
-  async runSystemStatusCheck() {
-    const checks = [];
-    const secureContext = window.isSecureContext || location.hostname === "localhost";
-    checks.push(`secure connection ${secureContext ? "ready" : "not secure"}`);
-
-    let mic = false;
-    try {
-      if (navigator.mediaDevices?.getUserMedia) {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        mic = true;
-        stream.getTracks().forEach((track) => track.stop());
-      }
-    } catch (_) {}
-    checks.push(`microphone ${mic ? "ready" : "needs permission"}`);
-
-    let camera = !!navigator.mediaDevices?.getUserMedia;
-    if (this.stream?.getVideoTracks?.().length) camera = true;
-    checks.push(`camera ${camera ? "available" : "unavailable"}`);
-
-    const gps = !!navigator.geolocation;
-    checks.push(`GPS ${gps ? "available" : "unavailable"}`);
-
-    const contacts = window.emergencySOS?.getContacts?.() || [];
-    const hasEmergencyContact = contacts.some((c) => c.phone || c.email);
-    checks.push(`emergency contact ${hasEmergencyContact ? "configured" : "not configured"}`);
-
-    checks.push(`internet ${navigator.onLine ? "connected" : "offline"}`);
-
-    const message = `System check complete. ${checks.join(". ")}.`;
-    this.updateStatus(message, "info");
-    this.speak(message, true);
-  }
-
   isEmergencyCommand(command) {
     const lower = command.toLowerCase();
     const emergencyPatterns = [
@@ -2646,15 +2578,12 @@ class Netra {
    * Start voice interaction flow
    */
   startVoiceInteraction() {
-    const greeting =
-      'Hello! I am Netra. Object detection is starting now. Say "Hey Netra" anytime for voice commands, or long-press anywhere on the screen to stop or start detection.';
-    this.speak(greeting, true); // High priority
-
-    // Start continuous listening for the wake word immediately - no
-    // waiting for the greeting to finish first.
-    this.startContinuousListening();
+    // Keep startup silent and responsive. Voice recognition starts only
+    // after the user explicitly taps the microphone/uses the shortcut.
+    // This prevents the assistant from hearing its own startup speech and
+    // avoids a second always-on recognizer competing with command input.
     this.updateStatus(
-      '👂 Always listening for "Hey Netra" or Volume Up key',
+      'Ready. Tap the microphone and speak your command.',
       "info",
     );
   }
@@ -4694,7 +4623,7 @@ class Netra {
     };
   }
 
-  async translateMessage(text) {
+  async translateMessage(text, signal = undefined) {
     if (!text) {
       return "";
     }
@@ -4703,31 +4632,29 @@ class Netra {
       return text;
     }
 
+    const cacheKey = `${this.currentLanguage}::${text}`;
+    if (this.voiceTranslationCache.has(cacheKey)) {
+      return this.voiceTranslationCache.get(cacheKey);
+    }
+
     try {
       const response = await fetch("/api/translate", {
         method: "POST",
-
-        headers: {
-          "Content-Type": "application/json",
-        },
-
-        body: JSON.stringify({
-          text: text,
-
-          language: this.currentLanguage,
-        }),
+        headers: { "Content-Type": "application/json" },
+        signal,
+        body: JSON.stringify({ text, language: this.currentLanguage }),
       });
-
       const result = await response.json();
-
-      if (result.success) {
+      if (result.success && result.translated) {
+        this.voiceTranslationCache.set(cacheKey, result.translated);
         return result.translated;
       }
     } catch (error) {
-      console.error(error);
+      if (error?.name !== "AbortError") console.warn("Voice translation failed:", error);
+      return null;
     }
 
-    return text;
+    return null;
   }
   /**
    * Speak route overview when starting navigation
@@ -5113,13 +5040,18 @@ class Netra {
       const response = await fetch("/api/preferences");
       const preferences = await response.json();
 
-      if (preferences.language) {
+      // The language selected during onboarding is the local source of truth.
+      // A stale server preference must never switch the dashboard back to
+      // another language after the user has already selected one.
+      const localLanguage = localStorage.getItem("blindmate_language");
+      if (!localLanguage && preferences.language) {
         this.currentLanguage = preferences.language;
-        if (this.elements.languageSelect) {
-          this.elements.languageSelect.value = preferences.language;
-        }
-        this.applyUITranslations(preferences.language);
+        localStorage.setItem("blindmate_language", preferences.language);
       }
+      if (this.elements.languageSelect) {
+        this.elements.languageSelect.value = this.currentLanguage;
+      }
+      this.applyUITranslations(this.currentLanguage);
 
       if (preferences.tone) {
         this.currentTone = preferences.tone;
@@ -5231,6 +5163,13 @@ class Netra {
       return;
     }
 
+    // Only the newest speech request is allowed to continue. This prevents
+    // slow translation/TTS requests from finishing later and talking over a
+    // newer response.
+    if (this.voiceAbortController) this.voiceAbortController.abort();
+    const speechController = new AbortController();
+    this.voiceAbortController = speechController;
+
     /* ==========================================
        Translate Text
     ========================================== */
@@ -5240,7 +5179,11 @@ class Netra {
       // a native voice; if it does not, _speakNow() can use the server TTS
       // fallback below. We must never leave translated text unspoken simply
       // because Windows happens not to have the selected voice installed.
-      text = await this.translateMessage(text);
+      text = await this.translateMessage(text, speechController.signal);
+      if (speechController.signal.aborted || !text) {
+        console.warn("No translated text available; refusing to speak English fallback.");
+        return;
+      }
       if (!this.hasVoiceForLanguage(this.currentLanguage)) {
         // No voice installed for this language on this device/browser -
         // speaking translated text through the wrong voice would come out
@@ -5250,9 +5193,6 @@ class Netra {
       }
     }
     console.log("Final Text:", text);
-    // Keep the final spoken language text so the user can say "repeat"
-    // without needing to repeat the original command.
-    if (!isObjectAnnouncement) this.lastSpokenText = text;
 
     // Log to interaction history - skip continuous object-detection
     // announcements ("person ahead of you", etc), since those would
@@ -5260,28 +5200,6 @@ class Netra {
     if (!isObjectAnnouncement) {
       this.logInteraction(this.lastCommandText, text);
       this.lastCommandText = null;
-    }
-
-    /* ==========================================
-       Navigation Speech
-    ========================================== */
-
-    if (window.blindMateNavigation && window.blindMateNavigation.speak) {
-      console.log("Delegating speech:", text);
-
-      const navPriority = priority
-        ? "high"
-        : isObjectAnnouncement
-          ? "normal"
-          : "normal";
-
-      window.blindMateNavigation.speak(
-        text,
-
-        navPriority,
-      );
-
-      return;
     }
 
     const now = Date.now();
@@ -5366,12 +5284,14 @@ class Netra {
    */
   _speakNow(text) {
     try {
-      // Always use server TTS. The browser's speechSynthesis voices vary by
-      // operating system and installed language packs, which caused Hindi,
-      // Kannada, Tamil and Telugu to become silent on Windows. Server TTS
-      // gives the same selected-language output across desktop and mobile.
-      this._speakWithServerTTS(text);
-      return;
+      // If the selected language is unavailable in the device's native
+      // speech engine, use the backend TTS fallback. This is especially
+      // useful on Windows, while Android/iOS can normally use their native
+      // language voices.
+      if (this.currentLanguage !== "en-IN") {
+        this._speakWithServerTTS(text);
+        return;
+      }
 
       // Cancel any ongoing speech immediately to prevent overlaps
       this.synth.cancel();
@@ -5384,7 +5304,7 @@ class Netra {
       this.pendingAnnouncement = null;
 
       // Small delay to ensure cancellation is processed
-      setTimeout(() => {
+      {
         this.isSpeaking = true;
         this.lastSpeechTime = Date.now();
 
@@ -5429,18 +5349,17 @@ class Netra {
         utterance.onend = () => {
           console.log("Speech ended normally");
           this.isSpeaking = false;
-          // Longer delay before next speech for better clarity
-          setTimeout(() => this._processNextSpeech(), 750);
+          this._processNextSpeech();
         };
 
         utterance.onerror = (event) => {
           console.warn("Speech error:", event);
           this.isSpeaking = false;
-          setTimeout(() => this._processNextSpeech(), 750);
+          this._processNextSpeech();
         };
 
         this.synth.speak(utterance);
-      }, 50); // Small delay to ensure proper cancellation
+      }
     } catch (error) {
       this.isSpeaking = false;
       console.warn("Speech synthesis error:", error);
@@ -5450,36 +5369,42 @@ class Netra {
   async _speakWithServerTTS(text) {
     try {
       if (this.synth) this.synth.cancel();
+      if (this.currentAudio) {
+        try { this.currentAudio.pause(); } catch (_) {}
+        this.currentAudio = null;
+      }
       this.isSpeaking = true;
       this.lastSpeechTime = Date.now();
       const response = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: this.voiceAbortController?.signal,
         body: JSON.stringify({ text, language: this.currentLanguage }),
       });
       if (!response.ok) throw new Error(`TTS HTTP ${response.status}`);
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
-      audio.onended = () => {
+      this.currentAudio = audio;
+      const finish = () => {
         URL.revokeObjectURL(url);
+        if (this.currentAudio === audio) this.currentAudio = null;
         this.isSpeaking = false;
-        setTimeout(() => this._processNextSpeech(), 400);
+        this._processNextSpeech();
       };
-      audio.onerror = () => {
-        URL.revokeObjectURL(url);
-        this.isSpeaking = false;
-        console.warn("Server TTS playback failed");
-        setTimeout(() => this._processNextSpeech(), 400);
-      };
+      audio.onended = finish;
+      audio.onerror = finish;
       await audio.play();
     } catch (error) {
+      if (error?.name === "AbortError") {
+        this.isSpeaking = false;
+        return;
+      }
       console.warn("Server TTS fallback failed:", error);
       this.isSpeaking = false;
-      // Do not fall back to a Windows/browser voice here. A fallback voice
-      // can speak the selected-language text incorrectly or silently fail.
-      // Keep the response visible and continue the queue instead.
-      setTimeout(() => this._processNextSpeech(), 400);
+      // Do not fall back to an unrelated English system voice. Showing the
+      // translated text is safer than speaking the wrong language.
+      this.showTextInUI(text);
     }
   }
 
